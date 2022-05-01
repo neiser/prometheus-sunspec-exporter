@@ -5,6 +5,9 @@ on:
       - master
   workflow_dispatch:
 
+permissions:
+  packages: write
+
 jobs:
   build-on-linux:
     runs-on: ubuntu-latest
