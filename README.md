@@ -50,67 +50,19 @@ Options:
 
 ```
 
-When it runs for the first time it will call the device, and poll all the data in the model. 
-The model_ids filter then removes sets of data, (config, name, serial etc)
+When it connects to the device, it reads the list of models once and then only reads
+the models given in `--sunspec_model_ids`. The exporter logs only startup information
+and errors:
 
 ```
-✔ ~/projects/github.com/inosion/prometheus-sunspec-exporter [main|✚ 2…1] 
-12:43 $ docker run -ti --rm -p 9807:9807 inosion/sunspec-exporter start --port 9807 --sunspec_ip IPADDRESS --sunspec_port 502 --sunspec_address 126 --sunspec_model_ids 103,160
-{'--port': '9807',
- '--sunspec_address': '126',
- '--sunspec_ip': 'IPADDRESS',
- '--sunspec_model_ids': '103,160',
- '--sunspec_port': '502',
- 'start': True}
-# !!! Enumerating all models, removing from future reads unwanted ones
-#    Removed [Common (1)]
-#    Removed [Ethernet Link Layer (11)]
-#    Removed [IPv4 (12)]
-#  Keeping [Inverter (Three Phase) (103)]
-#    Removed [Nameplate (120)]
-#    Removed [Basic Settings (121)]
-#    Removed [Measurements_Status (122)]
-#    Removed [Immediate Controls (123)]
-#    Removed [Storage (124)]
-#    Removed [Static Volt-VAR (126)]
-#    Removed [Freq-Watt Param (127)]
-#    Removed [Dynamic Reactive Current (128)]
-#    Removed [Watt-PF (131)]
-#    Removed [Volt-Watt (132)]
-#  Keeping [Multiple MPPT Inverter Extension Model (160)]
-
-Timestamp: 2021-01-10T01:43:57Z
-# ---------------------
-# model: Inverter (Three Phase) (103)
-# ---------------------
-# Amps_A_A: 17.1
-# Amps_PhaseA_AphA_A: 5.7
-# Amps_PhaseB_AphB_A: 5.7
-# Amps_PhaseC_AphC_A: 5.7
-# Phase_Voltage_AN_PhVphA_V: 237.0
-# Phase_Voltage_BN_PhVphB_V: 232.10000000000002
-# Phase_Voltage_CN_PhVphC_V: 239.8
-# Watts_W_W: 4040.0
-# Hz_Hz_Hz: 49.980000000000004
-# VA_VA_VA: 4040.0
-# VAr_VAr_var: 0.0
-# WattHours_WH_Wh: 14722540.0
-# Cabinet_Temperature_TmpCab_C: 53
-# Operating_State_St: 4
-# Event1_Evt1: 0
-# ---------------------
-# model: Multiple MPPT Inverter Extension Model (160)
-# ---------------------
-# Number_of_Modules_N: 2
-# 01_Input_ID_ID: 1
-# 01_DC_Current_DCA_A: 11.0
-# 01_DC_Voltage_DCV_V: 373
-# 01_DC_Power_DCW_W: 4100.0
-# 02_Input_ID_ID: 2
-# 02_DC_Current_DCA_A: 0.0
-# 02_DC_Voltage_DCV_V: 0
-# 02_DC_Power_DCW_W: 0.0
+INFO Connected to 192.168.178.104:502/1, collecting models Inverter (Single Phase) (101)
+INFO Serving metrics on port 9807 for 192.168.178.104:502/1, models 101
 ```
+
+If a read fails, for example because the inverter rebooted, the scrape returns
+`sunspec_up 0` and no device metrics, and the next scrape connects again and
+re-reads the model list. A successful scrape returns `sunspec_up 1`.
+
 # Finding out What data you want
 
 SunSpec devices conform to some data standards,
@@ -206,3 +158,36 @@ This filter config removes that problem.
 # Testing with SunSpec
 
 See [testing/](testing/)
+
+# NixOS
+
+The flake provides `packages.x86_64-linux.default`, `overlays.default` (adds
+`pkgs.prometheus-sunspec-exporter`) and a NixOS module. The service runs with
+`DynamicUser` and restarts automatically. `pysunspec` is packaged from PyPI.
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    prometheus-sunspec-exporter.url = "github:neiser/prometheus-sunspec-exporter";
+    prometheus-sunspec-exporter.inputs.nixpkgs.follows = "nixpkgs";
+  };
+
+  outputs = { nixpkgs, prometheus-sunspec-exporter, ... }: {
+    nixosConfigurations.home-server = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        prometheus-sunspec-exporter.nixosModules.default
+        {
+          services.prometheus-sunspec-exporter = {
+            enable = true;
+            sunspecHost = "192.168.178.104";
+            # sunspecPort = 502; sunspecAddress = 1; modelIds = [ "101" ]; port = 9807;
+            # extraArgs = [ "--filter" "Amps_Phase[A-Z]_Aph[A-Z] gt:3276 0" ];
+          };
+        }
+      ];
+    };
+  };
+}
+```
