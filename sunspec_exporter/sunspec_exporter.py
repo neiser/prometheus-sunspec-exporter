@@ -50,17 +50,21 @@ except:
     import elementtree.ElementTree as ET
 import sunspec.core.pics as pics
 from xml.dom import minidom
+import logging
 import sys
+import threading
 import time
 import re
 import collections
 
+log = logging.getLogger('sunspec_exporter')
+
 Filter = collections.namedtuple('Filter', ['regex', 'fn'])
 class FnMapping:
 
-    def filter_fn(fn, *args):
+    def filter_fn(fn, replacement, *args):
         def filter(v):
-            return fn(*args, v)
+            return fn(float(replacement), *map(float, args), v)
         return filter
 
     def gt(replacement, upper_bound, val):
@@ -99,132 +103,106 @@ REQUEST_TIME = Summary('sunspec_fn_collect_data',
 
 # Decorate function with metric.
 @REQUEST_TIME.time()
-def collect_data(sunspec_client, model_ids, filters):
+def collect_data(sunspec_client, filters):
+    results = {}
+    sunspec_client.read()
 
-    if sunspec_client is None:
-        print("no sunspec client defined, init() call, ignoring")
-        return
+    for model in sunspec_client.device.models_list:
+        for block in model.blocks:
+            if block.index > 0:
+                index = '%02d_' % (block.index)
+            else:
+                index = ''
+            for point in block.points_list:
+                value = to_number(point.value)
+                if value is None:
+                    continue
+                if point.point_type.label:
+                    point_label = re.sub('[^a-zA-Z0-9_]', '_', point.point_type.label)
+                    metric_label = f"{index}{point_label}_{point.point_type.id}"
+                else:
+                    metric_label = f"{index}{point.point_type.id}"
 
-    results = { }
+                units = point.point_type.units
+                if units is not None:
+                    unit_label = f"_{units}"
+                    metric_type = "Gauge"
+                else:
+                    unit_label = ""
+                    metric_type = "Counter"
 
-    if sunspec_client is not None:
-        print( '\nTimestamp: %s' % (time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())))
+                for x in filters:
+                    if x.regex.match(metric_label):
+                        value = x.fn(value)
 
-        sunspec_client.read()
-
-        # requested_models = [ model for model in sunspec_client.device.models_list if str(model.id) in model_ids]
-
-        
-        for model in sunspec_client.device.models_list:
-                label = model_name(model)
-                print("# ---------------------", flush=True)
-                print(f"# model: {label}", flush=True)
-                print("# ---------------------", flush=True)
-                for block in model.blocks:
-                    if block.index > 0:
-                        index = '%02d_' % (block.index)
-                    else:
-                        index = ''
-                    for point in block.points_list:
-                        if point.value is not None:
-                            if point.point_type.label:
-                                point_label = re.sub('[^a-zA-Z0-9_]', '_', point.point_type.label)
-                                metric_label = f"{index}{point_label}_{point.point_type.id}"
-                            else:
-                                metric_label = f"{index}{point.point_type.id}"
-                            
-                            units = point.point_type.units
-                            unit_label = ""
-
-                            if units is not None:
-                                unit_label = f"_{units}"
-                                metric_type = "Gauge"
-                            else:
-                                metric_type = "Counter"
-                            
-                            if point.point_type.type == suns.SUNS_TYPE_BITFIELD16:
-                                value = '%x' % (point.value)
-                            elif point.point_type.type == suns.SUNS_TYPE_BITFIELD32:
-                                value = '%x' % (point.value)
-                            else:
-                                value = str(point.value).rstrip('\0')
-                            
-                            final_label = f"{metric_label}{unit_label}"
-
-                            if len(filters) > 0:
-                                for x in filters:
-                                    if x.regex.match(metric_label):
-                                        old_value = value
-                                        value = x.fn(old_value)
-                                        if old_value != value:
-                                            print(f"# !! Filtered {metric_label}. {x.regex} matched. {old_value} -> {value}", flush=True)
-                                        else:
-                                            print(f"# !! Filter no match {metric_label}. {x.regex} matched. {old_value} -> {value}", flush=True)
-
-                            print(f"# {final_label}: {value}", flush=True)
-                            results[f"{final_label}"] = { "value" : value, "metric_type": metric_type }
+                results[f"{metric_label}{unit_label}"] = {"value": value, "metric_type": metric_type}
 
     return results
+
+
+def to_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value
 
 
 class SunspecCollector(object):
     "The ip, port and target is of the modbus/sunspec device"
 
-    def __init__(self, sunspec_client, model_ids, ip, port, target, filters):
-        self.sunspec_client = sunspec_client
+    def __init__(self, model_ids, ip, port, target, filters):
         self.model_ids = model_ids
         self.ip = ip
         self.port = port
         self.target = target
         self.filters = filters
+        self.sunspec_client = None
+        self.lock = threading.Lock()
+
+    def connect(self):
+        sunspec_client = client.SunSpecClientDevice(
+            client.TCP, self.target, ipaddr=self.ip, ipport=self.port, timeout=10.0
+        )
+        # Reading only the requested models reduces the load on the device.
+        for model in sunspec_client.device.models_list.copy():
+            if str(model.id) not in self.model_ids:
+                sunspec_client.device.models_list.remove(model)
+        log.info('Connected to %s:%s/%s, collecting models %s', self.ip, self.port, self.target,
+                 ', '.join(model_name(m) for m in sunspec_client.device.models_list))
+        return sunspec_client
+
+    def disconnect(self):
+        try:
+            self.sunspec_client.close()
+        except Exception:
+            pass
+        self.sunspec_client = None
 
     def collect(self):
-        # yield GaugeMetricFamily('my_gauge', 'Help text', value=7)
-        results = collect_data(self.sunspec_client, self.model_ids, self.filters)
-        for x in results:  # call sunspec here
-            the_value = results[x]["value"]
-            if is_numeric(the_value):
-                m = None
-                if results[x]["metric_type"] == "Counter":
-                    m = CounterMetricFamily(f"sunspec_{x}", "", labels=[
-                                            "ip", "port", "target"])
-                if results[x]["metric_type"] == "Gauge":
-                    m = GaugeMetricFamily(f"sunspec_{x}", "", labels=[
-                                            "ip", "port", "target"])
-            
-                m.add_metric([self.ip, str(self.port),str(self.target)], the_value)
-                yield m
+        with self.lock:
+            try:
+                if self.sunspec_client is None:
+                    self.sunspec_client = self.connect()
+                results = collect_data(self.sunspec_client, self.filters)
+            except Exception as e:
+                log.error('Reading %s:%s/%s failed: %s', self.ip, self.port, self.target, e)
+                self.disconnect()
+                yield up_metric(0)
+                return
+
+        labels = [self.ip, str(self.port), str(self.target)]
+        for name, result in results.items():
+            if result["metric_type"] == "Counter":
+                m = CounterMetricFamily(f"sunspec_{name}", "", labels=["ip", "port", "target"])
             else:
-                print(f"# metric from {self.ip}:{self.port}/{self.target} sunspec_{x} Value: {the_value} is a {type(the_value)}, Ignoring", flush=True)
+                m = GaugeMetricFamily(f"sunspec_{name}", "", labels=["ip", "port", "target"])
+            m.add_metric(labels, result["value"])
+            yield m
+        yield up_metric(1)
 
 
-# https://stackoverflow.com/a/52676692/2150411
-import ast
-import numbers
-def is_numeric(obj):
-    try:
-        if isinstance(obj, numbers.Number):
-            return True
-        elif isinstance(obj, str):
-            nodes = list(ast.walk(ast.parse(obj)))[1:]
-            if not isinstance(nodes[0], ast.Expr):
-                return False
-            if not isinstance(nodes[-1], ast.Num):
-                return False
-            nodes = nodes[1:-1]
-            for i in range(len(nodes)):
-                #if used + or - in digit :
-                if i % 2 == 0:
-                    if not isinstance(nodes[i], ast.UnaryOp):
-                        return False
-                else:
-                    if not isinstance(nodes[i], (ast.USub, ast.UAdd)):
-                        return False
-            return True
-        else:
-            return False
-    except:
-        return False
+def up_metric(value):
+    return GaugeMetricFamily('sunspec_up', 'Whether the last read from the SunSpec device succeeded', value=value)
+
 
 def model_name(model):
     "Model Data Name"
@@ -309,55 +287,33 @@ def sunspec_test(ip, port, address):
 
 
 if __name__ == '__main__':
-    # Start up the server to expose the metrics.
     arguments = docopt(__doc__, version='sunspec-prometheus-exporter 1.0')
-    print(arguments, flush=True)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
     sunspec_ip =        arguments["--sunspec_ip"]
     sunspec_port =      int(arguments["--sunspec_port"])
     sunspec_address =   arguments["--sunspec_address"]
- 
+
     if arguments["query"]:
 
         sunspec_test(sunspec_ip, sunspec_port, sunspec_address)
         sys.exit(0)
 
-  
+
     if arguments["start"]:
 
         sunspec_model_ids = arguments["--sunspec_model_ids"].split(",")
-        try:
-            sunspec_client = client.SunSpecClientDevice(
-                client.TCP, sunspec_address, ipaddr=sunspec_ip, ipport=sunspec_port, timeout=10.0
-            )
-        except client.SunSpecClientError as e:
-            print('Error: %s' % (e))
-            sys.exit(1)
-
-        # remove the models that don't match what we want
-        # this will make reads faster (ignore unnecessary model data sets)
 
         filters = []
         if arguments["--filter"] is not None:
             for f in arguments["--filter"]:
                 (filter_metric_regex, func_n_params, replacement) = f.split(" ")
                 func_name, *parameters = func_n_params.split(":")
-                func = FnMapping.filter_fn(eval(f"FnMapping.{func_name}"), replacement, *parameters)
-                print(f"# Added filter: {func_name}({func_n_params}) [{replacement}] -> {filter_metric_regex}", flush=True)
+                func = FnMapping.filter_fn(getattr(FnMapping, func_name), replacement, *parameters)
+                log.info('Added filter %s(%s) [%s] -> %s', func_name, func_n_params, replacement, filter_metric_regex)
                 filters.append(Filter(regex=re.compile(filter_metric_regex),fn=func))
 
-        print("# !!! Enumerating all models, removing from future reads unwanted ones", flush=True)
-        models = sunspec_client.device.models_list.copy()
-        for model in models:
-            name = model_name(model)
-            if str(model.id) not in sunspec_model_ids:
-                print(f"#    Removed [{name}]", flush=True)
-                sunspec_client.device.models_list.remove(model)
-            else:
-                print(f"#  Will collect [{name}]", flush=True)
-
         REGISTRY.register(SunspecCollector(
-                sunspec_client,
                 sunspec_model_ids,
                 sunspec_ip,
                 sunspec_port,
@@ -366,7 +322,10 @@ if __name__ == '__main__':
             )
         )
 
-        start_http_server(int(arguments["--port"]))
+        port = int(arguments["--port"])
+        start_http_server(port)
+        log.info('Serving metrics on port %d for %s:%d/%s, models %s',
+                 port, sunspec_ip, sunspec_port, sunspec_address, ','.join(sunspec_model_ids))
 
         while True:
             time.sleep(1000)
